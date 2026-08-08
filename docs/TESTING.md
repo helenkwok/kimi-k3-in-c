@@ -19,6 +19,15 @@ analytic cap.
 **`test_cache`**, the streaming expert cache: prefetch, eviction, and mixed batch/serial
 access. Uses a synthetic shard of structurally faithful experts, a few KB.
 
+**`test_trunk`**, the streamed dense trunk's ring-safety contract. It builds a two-layer
+packed trunk at runtime, with a complete one-element KDA+dense tensor set and a distinct
+byte pattern in each 4 KiB layer. A one-slot budget must disable the asynchronous reader
+entirely, so prefetch cannot overwrite the layer whose pointers the caller is still using.
+A two-slot budget must enable the reader and prefetch the next layer into the spare slot
+without changing the current layer. This is the weightless regression for the real
+checkpoint corruption fixed in `918cc682`: the old one-slot reader completed normally but
+emitted different tokens because layer L+1 was read over layer L during computation.
+
 **`test_st`**, the safetensors reader: dtype widening, offsets, tail bytes, escaped
 tensor names, and a tensor deliberately containing non-finite values.
 
