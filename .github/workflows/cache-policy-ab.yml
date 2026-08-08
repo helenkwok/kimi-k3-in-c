@@ -1,0 +1,32 @@
+name: Cache Policy A/B Harness
+
+on:
+  pull_request:
+    paths:
+      - 'benchmarks/cache-policy-ab.sh'
+      - 'tests/scripts/test_cache_policy_ab.sh'
+      - 'tests/fixtures/cache_policy_ab/**'
+      - '.github/workflows/cache-policy-ab.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    name: checkpoint-free A/B harness test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Shellcheck harness and fixture
+        run: |
+          shellcheck -S warning \
+            benchmarks/cache-policy-ab.sh \
+            tests/scripts/test_cache_policy_ab.sh \
+            tests/fixtures/cache_policy_ab/fake_k3.sh
+      - name: Exercise A/B end to end without weights
+        run: bash tests/scripts/test_cache_policy_ab.sh
