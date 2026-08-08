@@ -94,7 +94,7 @@ INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
 # ----------------------------------------------------------------------------- files --
 ENGINE_SRC := src/core/k3_ops.c \
               src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
-              src/cache/k3_cache.c \
+              src/cache/k3_arc.c src/cache/k3_cache.c \
               src/model/k3_bind.c
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
 
@@ -102,7 +102,7 @@ CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_cache test_trunk test_st test_cfg test_tok scale_test k3_model
+UNIT_TESTS := test_ops test_arc test_cache test_trunk test_st test_cfg test_tok scale_test k3_model
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -136,7 +136,11 @@ $(BIN):
 $(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+$(BIN)/test_arc: tests/unit/test_arc.c $(BUILD)/src/cache/k3_arc.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
+                   $(BUILD)/src/cache/k3_arc.o \
                    $(BUILD)/src/io/k3_load.o $(BUILD)/src/io/k3_st.o \
                    $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
@@ -174,6 +178,7 @@ $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(
 ## test: everything that needs no model weights
 test: $(TEST_BINS)
 	@echo "== op kernels ==";        ./$(BIN)/test_ops $(FIXTURES)/ops
+	@echo "== ARC metadata ==";      ./$(BIN)/test_arc
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== trunk streaming ==";   ./$(BIN)/test_trunk
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \

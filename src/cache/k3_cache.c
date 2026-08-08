@@ -7,12 +7,23 @@
 #include <time.h>
 #include <sys/mman.h>
 
+#include "k3_arc.h"
 #include "k3_cache.h"
 
 static double now_s(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+static void disable_arc(K3Cache *c, const char *why)
+{
+    if (c->policy != K3_CACHE_POLICY_ARC) return;
+    fprintf(stderr, "k3_cache: ARC disabled%s%s; falling back to LRU\n",
+            why ? ": " : "", why ? why : "");
+    k3_arc_destroy((K3Arc *)c->policy_state);
+    c->policy_state = NULL;
+    c->policy = K3_CACHE_POLICY_LRU;
 }
 
 /* Resolve a slot to the three (packed, scale) pairs the kernels want. */
@@ -54,18 +65,41 @@ static int pick_victim(K3Cache *c)
     return best;
 }
 
+static int pick_empty(const K3Cache *c)
+{
+    for (int i = 0; i < c->nslot; i++) if (c->key_of[i] == K3_SLOT_EMPTY) return i;
+    return -1;
+}
+
 /* Bring (layer, expert) resident and return its slot, or -1. */
 static int admit(K3Cache *c, int layer, int expert)
 {
     const int32_t key = layer * c->n_experts + expert;
     int slot = c->slot_of[key];
+    int32_t arc_victim = -1;
+
+    /* A resident hit needs no checkpoint lookup, but ARC still needs to observe the
+     * request so it can promote T1->T2 or refresh T2 recency. Keep the physical slot as
+     * the source of truth and fall back to LRU if the metadata ever disagrees. */
     if (slot >= 0) {
+        if (c->policy == K3_CACHE_POLICY_ARC) {
+            int arc_hit = 0;
+            if (k3_arc_access((K3Arc *)c->policy_state, key, &arc_hit, &arc_victim) != 0) {
+                disable_arc(c, "metadata access failed");
+            } else if (!arc_hit || arc_victim >= 0) {
+                disable_arc(c, "logical and physical residency diverged");
+            }
+        }
         c->hits++;
         c->used_at[slot] = ++c->clock;
         return slot;
     }
     c->misses++;
 
+    /* Resolve and validate the physical expert BEFORE advancing ARC on a miss. If the
+     * checkpoint is incomplete or malformed, there is then no logical transition to
+     * roll back and the next request cannot observe ARC claiming residency for bytes
+     * that never existed. */
     K3ExpertRef r;
     if (k3_expert_ref(c->st, layer, expert, &r) != 0) return -1;
     if (r.nbytes > c->slot_bytes) {
@@ -74,7 +108,37 @@ static int admit(K3Cache *c, int layer, int expert)
         return -1;
     }
 
-    slot = pick_victim(c);
+    if (c->policy == K3_CACHE_POLICY_ARC) {
+        int arc_hit = 0;
+        if (k3_arc_access((K3Arc *)c->policy_state, key, &arc_hit, &arc_victim) != 0) {
+            disable_arc(c, "metadata access failed");
+            arc_victim = -1;
+        } else if (arc_hit) {
+            /* Physical absence with an ARC hit is corruption of the policy/slot
+             * relationship. The physical map wins and ordinary LRU continues safely. */
+            disable_arc(c, "logical and physical residency diverged");
+            arc_victim = -1;
+        }
+    }
+
+    if (c->policy == K3_CACHE_POLICY_ARC) {
+        if (arc_victim >= 0) {
+            slot = c->slot_of[arc_victim];
+            if (slot < 0 || c->pinned[slot]) {
+                disable_arc(c, "ARC selected an unavailable physical victim");
+                slot = pick_victim(c);
+            }
+        } else {
+            slot = pick_empty(c);
+            if (slot < 0) {
+                disable_arc(c, "ARC expected a free slot but none exists");
+                slot = pick_victim(c);
+            }
+        }
+    } else {
+        slot = pick_victim(c);
+    }
+
     if (slot < 0) {
         fprintf(stderr, "k3_cache: every slot is pinned, cannot admit L%d expert %d\n",
                 layer, expert);
@@ -91,7 +155,9 @@ static int admit(K3Cache *c, int layer, int expert)
     if (got != r.nbytes) {
         fprintf(stderr, "k3_cache: short load of L%d expert %d (%lld of %lld)\n",
                 layer, expert, (long long)got, (long long)r.nbytes);
-        c->key_of[slot] = -1;
+        c->key_of[slot] = K3_SLOT_EMPTY;
+        if (c->policy == K3_CACHE_POLICY_ARC)
+            disable_arc(c, "expert read failed after an ARC state transition");
         return -1;
     }
     c->bytes_read += (uint64_t)got;
@@ -122,7 +188,11 @@ static int admit(K3Cache *c, int layer, int expert)
  * leave a failed read with a slot that claims to hold an expert it does not -- and the
  * next request for that expert would count a HIT and multiply garbage. That exact bug
  * existed in the trunk ring and is why the order here is deliberate.
- */
+ *
+ * Experimental ARC deliberately does NOT enter this function. getmany reserves misses
+ * before get() consumes the top-k, so mixing ARC's logical request order with these
+ * physical reservations needs a separate design. The A/B experiment disables getmany
+ * and compares ARC with K3_NOPREFETCH=1 LRU instead. */
 static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
 {
     K3Cache *c = (K3Cache *)self;
@@ -260,17 +330,40 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     memset(c, 0, sizeof *c);
     c->src.get = cache_get;
     c->src.resident = cache_resident;
-    /* K3_NOPREFETCH=1 disables the batch path at runtime. An A/B between two BUILDS
-     * compares two binaries; an A/B on one binary compares one decision, which is the
-     * only way to attribute a timing difference to the prefetch rather than to the
-     * compiler, the layout, or the weather. */
-    c->src.getmany = getenv("K3_NOPREFETCH") ? NULL : cache_getmany;
-    if (!c->src.getmany)
-        fprintf(stderr, "k3_cache: batch prefetch DISABLED by K3_NOPREFETCH\n");
     c->src.ctx = c;
     c->st = st;
     c->n_layers = cfg->n_layers;
     c->n_experts = cfg->n_experts;
+
+    const char *policy = getenv("K3_CACHE_POLICY");
+    if (!policy || !*policy || !strcmp(policy, "lru")) {
+        c->policy = K3_CACHE_POLICY_LRU;
+    } else if (!strcmp(policy, "arc")) {
+        c->policy = K3_CACHE_POLICY_ARC;
+    } else {
+        fprintf(stderr, "k3_cache: unknown K3_CACHE_POLICY=%s (use lru or arc)\n", policy);
+        return -1;
+    }
+
+    /* K3_NOPREFETCH=1 disables the batch path at runtime. An A/B between two BUILDS
+     * compares two binaries; an A/B on one binary compares one decision, which is the
+     * only way to attribute a timing difference to the prefetch rather than to the
+     * compiler, the layout, or the weather.
+     *
+     * ARC is intentionally serial-only in this first experiment. getmany reserves a
+     * complete top-k before get() touches it, while ARC's evidence was measured as a
+     * logical request stream. Disabling batch prefetch keeps the experiment honest and
+     * gives a fair same-binary baseline via K3_NOPREFETCH=1 K3_CACHE_POLICY=lru. */
+    if (c->policy == K3_CACHE_POLICY_ARC) {
+        c->src.getmany = NULL;
+        fprintf(stderr,
+                "k3_cache: EXPERIMENTAL ARC enabled; batch prefetch disabled.\n"
+                "          compare with K3_NOPREFETCH=1 K3_CACHE_POLICY=lru on the same binary\n");
+    } else {
+        c->src.getmany = getenv("K3_NOPREFETCH") ? NULL : cache_getmany;
+        if (!c->src.getmany)
+            fprintf(stderr, "k3_cache: batch prefetch DISABLED by K3_NOPREFETCH\n");
+    }
 
     /* Size a slot from the checkpoint rather than from arithmetic: find any expert and
      * ask how many bytes it actually occupies. */
@@ -343,12 +436,18 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         k3_cache_free(c); return -1;
     }
     for (size_t i = 0; i < nkey; i++) c->slot_of[i] = -1;
-    for (int i = 0; i < c->nslot; i++) c->key_of[i] = -1;
+    for (int i = 0; i < c->nslot; i++) c->key_of[i] = K3_SLOT_EMPTY;
+
+    if (c->policy == K3_CACHE_POLICY_ARC) {
+        c->policy_state = k3_arc_create((int)nkey, c->nslot);
+        if (!c->policy_state) { k3_cache_free(c); return -1; }
+    }
     return 0;
 }
 
 void k3_cache_free(K3Cache *c)
 {
+    k3_arc_destroy((K3Arc *)c->policy_state);
     free(c->arena); free(c->slot_of); free(c->key_of);
     free(c->used_at); free(c->pinned); free(c->ref); free(c->pad); free(c->hist);
     free(c->trace);
@@ -373,6 +472,8 @@ int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
     if (key < 0 || key >= c->n_layers * c->n_experts) return 0;
     const int slot = c->slot_of[key];
     if (slot < 0) return 0;
+    if (pin && c->policy == K3_CACHE_POLICY_ARC)
+        disable_arc(c, "permanent pinning requested");
     c->pinned[slot] = pin ? 1 : 0;
     return 1;
 }
@@ -401,6 +502,9 @@ void k3_cache_report(const K3Cache *c, const char *label)
     int resident = 0, pinned = 0;
     for (int i = 0; i < c->nslot; i++) { if (c->key_of[i] >= 0) resident++; if (c->pinned[i]) pinned++; }
     printf("cache [%s]\n", label ? label : "");
+    printf("  replacement  : %s%s\n",
+           c->policy == K3_CACHE_POLICY_ARC ? "ARC" : "LRU",
+           c->policy == K3_CACHE_POLICY_ARC ? " (experimental, serial)" : "");
     printf("  slots        : %d of %.2f MB = %.2f GB arena (%d resident, %d pinned)\n",
            c->nslot, (double)c->slot_bytes / 1e6,
            (double)c->nslot * c->slot_bytes / 1e9, resident, pinned);

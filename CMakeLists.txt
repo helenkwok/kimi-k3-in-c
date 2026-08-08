@@ -60,6 +60,7 @@ add_library(k3 STATIC
   src/io/k3_st.c
   src/io/k3_load.c
   src/io/k3_trunk.c
+  src/cache/k3_arc.c
   src/cache/k3_cache.c
   src/model/k3_bind.c)
 
@@ -94,6 +95,7 @@ function(k3_add_test name src)
 endfunction()
 
 k3_add_test(test_ops    tests/unit/test_ops.c)
+k3_add_test(test_arc    tests/unit/test_arc.c)
 k3_add_test(test_cache  tests/unit/test_cache.c)
 k3_add_test(test_trunk  tests/unit/test_trunk.c)
 k3_add_test(test_st     tests/unit/test_st.c)
@@ -108,6 +110,7 @@ set(FIX ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
 # systems are documented as interchangeable, so a test present in one and absent from
 # the other silently gives ctest less coverage than `make test`.
 add_test(NAME ops        COMMAND test_ops   ${FIX}/ops)
+add_test(NAME arc        COMMAND test_arc)
 add_test(NAME cache      COMMAND test_cache ${FIX}/cache)
 add_test(NAME trunk      COMMAND test_trunk)
 add_test(NAME config     COMMAND test_cfg   fixture ${FIX}/ref_k3.json)

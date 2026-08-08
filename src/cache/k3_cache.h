@@ -16,8 +16,13 @@
  *   reading a seventh of the bytes is faster, not slower.
  *
  * REPLACEMENT POLICY
- *   LRU with pinning. Two things make
- *   plain LRU safe here:
+ *   LRU with pinning is the default. `K3_CACHE_POLICY=arc` enables an EXPERIMENTAL
+ *   Adaptive Replacement Cache path for one-binary A/B measurements. ARC is currently
+ *   serial-only: batch prefetch is disabled in that mode so replacement policy can be
+ *   isolated from the getmany reservation order. Compare against
+ *   `K3_NOPREFETCH=1 K3_CACHE_POLICY=lru` on the same binary.
+ *
+ *   Two things make plain LRU safe here:
  *     - k3_moe fetches an expert and immediately uses it, so a slot handed out cannot
  *       be evicted before use as long as capacity exceeds topk. The constructor
  *       enforces that rather than trusting it.
@@ -44,6 +49,9 @@
 #define K3_SLOT_EMPTY     (-1)
 #define K3_SLOT_INFLIGHT  (-2)
 
+#define K3_CACHE_POLICY_LRU 0
+#define K3_CACHE_POLICY_ARC 1
+
 typedef struct {
     K3ExpertSrc  src;             /* MUST be first: pass &cache->src to K3MoeW */
 
@@ -64,6 +72,13 @@ typedef struct {
                                    * read is widened to aligned bounds             */
 
     uint64_t     clock;
+
+    /* Optional replacement-policy metadata. policy_state is an internal K3Arc* when
+     * policy == K3_CACHE_POLICY_ARC; kept opaque here so the I/O cache API does not
+     * expose ARC's linked-list representation. */
+    int          policy;
+    void        *policy_state;
+
     /* stats */
     uint64_t     hits, misses, evictions, bytes_read;
     /* Experts brought resident by the BATCH prefetch rather than by get().
@@ -98,7 +113,10 @@ int  k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_
 void k3_cache_free(K3Cache *c);
 
 /* Pin or unpin whatever slot currently holds this expert. Pinning a resident hot set
- * is the payoff from the histogram. Returns 0 if the expert was not resident. */
+ * is the payoff from the histogram. Returns 0 if the expert was not resident.
+ * Requesting a pin while experimental ARC is active safely falls back to LRU, because
+ * the current ARC experiment deliberately does not mix permanent pinning with ARC's
+ * logical capacity. */
 int  k3_cache_pin(K3Cache *c, int layer, int expert, int pin);
 
 /* Load an expert without returning it, so a prefetcher can warm the cache. */
