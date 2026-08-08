@@ -21,6 +21,9 @@
  *                   appeared under pressure, because with a roomy cache pick_victim
  *                   returns genuinely free slots and the aliasing never happens.
  *   4 ACCOUNTING    requests, hits and prefetch_reads stay mutually consistent.
+ *   5 ARC A/B       the opt-in ARC experiment uses the same physical cache correctly,
+ *                   stays byte-exact under pressure, disables getmany as documented,
+ *                   and falls back safely to LRU if permanent pinning is requested.
  *
  * usage: test_cache <fixture_dir> [n_experts]
  *        fixture_dir comes from tools/make_cache_fixture.py
@@ -106,8 +109,11 @@ int main(int argc, char **argv)
     if (k3_expert_ref(&st, 0, 0, &probe) != 0) { fprintf(stderr, "no expert 0\n"); return 2; }
     K3Cache cache;
     int ok_init = 0;
+    int64_t chosen_budget = 0;
     for (int64_t budget = probe.nbytes * 8; budget <= probe.nbytes * 4096; budget *= 2) {
-        if (k3_cache_init(&cache, &st, &c, budget) == 0) { ok_init = 1; break; }
+        if (k3_cache_init(&cache, &st, &c, budget) == 0) {
+            ok_init = 1; chosen_budget = budget; break;
+        }
     }
     if (!ok_init) { fprintf(stderr, "cache init failed at every budget\n"); return 2; }
     { char b[80]; snprintf(b, sizeof b, "%d slots for %d experts, top-%d",
@@ -180,6 +186,48 @@ int main(int argc, char **argv)
       ck(bad3 == 0, "mixed batch and serial", b); }
 
     k3_cache_free(&cache);
+
+    /* ---- 5: experimental ARC through the real physical cache ---- */
+    setenv("K3_CACHE_POLICY", "arc", 1);
+    unsetenv("K3_NOPREFETCH");
+    K3Cache arc;
+    if (k3_cache_init(&arc, &st, &c, chosen_budget) != 0) {
+        ck(0, "ARC cache init", "init failed");
+    } else {
+        ck(arc.policy == K3_CACHE_POLICY_ARC, "ARC policy selected", NULL);
+        ck(arc.src.getmany == NULL, "ARC disables batch prefetch", NULL);
+
+        int bad_arc = 0;
+        /* Non-monotone order creates both recency and frequency pressure rather than a
+         * pure cyclic scan, while byte identity remains the only correctness oracle. */
+        for (int pass = 0; pass < 4; pass++) {
+            for (int i = 0; i < NE; i++) {
+                const int e = (i * 7 + pass * 3) % NE;
+                K3ExpertQ q;
+                if (arc.src.get(&arc.src, 0, e, &q) != 0) { bad_arc++; continue; }
+                if (!same_expert(&st, 0, e, &q)) bad_arc++;
+            }
+        }
+        { char b[80]; snprintf(b, sizeof b, "%d wrong, policy %s", bad_arc,
+                               arc.policy == K3_CACHE_POLICY_ARC ? "ARC" : "fell back");
+          ck(bad_arc == 0 && arc.policy == K3_CACHE_POLICY_ARC,
+             "ARC reads are byte-exact under pressure", b); }
+
+        /* Pinning is supported by preserving the existing semantics and dropping only
+         * the experimental policy. Make expert 0 resident first so pin() must succeed. */
+        K3ExpertQ q0;
+        if (arc.src.get(&arc.src, 0, 0, &q0) != 0) {
+            ck(0, "ARC pin fallback", "could not make expert 0 resident");
+        } else {
+            const int pinned = k3_cache_pin(&arc, 0, 0, 1);
+            const int slot0 = arc.slot_of[0];
+            ck(pinned && arc.policy == K3_CACHE_POLICY_LRU && slot0 >= 0 && arc.pinned[slot0],
+               "ARC pin falls back to LRU safely", NULL);
+        }
+        k3_cache_free(&arc);
+    }
+    unsetenv("K3_CACHE_POLICY");
+
     k3_st_close(&st);
     printf("\n%s\n", g_fail ? "CACHE TESTS FAILED" : "CACHE TESTS PASSED");
     return g_fail ? 1 : 0;
