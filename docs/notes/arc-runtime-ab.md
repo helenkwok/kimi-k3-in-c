@@ -26,19 +26,62 @@ Use the **same binary, prompt/ids, memory budgets, thread count and checkpoint**
 runs. ARC is not being compared with normal production LRU here; it is being compared
 with serial LRU so replacement policy is the intended independent variable.
 
-## What to record
+## Reproducible harness
 
-For each side of the A/B, record:
+`benchmarks/cache-policy-ab.sh` runs the comparison, alternates policy order between
+repetitions, verifies generated ids, saves a cache trace for every run, and prints a
+summary of whole-run physical expert I/O and timing dispersion.
 
-1. emitted token ids (must be identical),
-2. `cache [...]` requests/hits/misses/evictions,
-3. `read from disk` bytes and loading time,
-4. total token wall time,
-5. `--dump-cache-trace` output for replay through `tools/sim_cache.py`.
+The first useful run targets the 64 GB expert-cache tier where the old trace showed the
+largest ARC separation:
 
-A useful first sweep is the region where the old trace showed separation: roughly 32,
-64 and 128 GB of expert cache. Repeat timings; the repository's earlier campaign found
-enough run-to-run variation that a single timing should not be treated as a speedup.
+```bash
+make -j
+benchmarks/cache-policy-ab.sh ~/k3model ~/k3trunk /tmp/k3-arc-ab 64 60 3
+```
+
+Arguments are:
+
+```text
+cache-policy-ab.sh <model_dir> <trunk_dir> <out_dir> [cache_gb_csv] [trunk_gb] [reps]
+```
+
+A broader sweep, on a machine with enough RAM, is:
+
+```bash
+benchmarks/cache-policy-ab.sh ~/k3model ~/k3trunk /tmp/k3-arc-ab \
+    32,64,128 60 3
+```
+
+The harness uses token ids by default so tokenizer behavior cannot confound the A/B. Set
+`K3_AB_IDS`, `K3_AB_GEN`, and `OMP_NUM_THREADS` before invoking it to change the workload
+while keeping both policies identical.
+
+It deliberately alternates order: odd repetitions run LRU then ARC, even repetitions run
+ARC then LRU. Even with direct I/O, device temperature and unrelated system load can drift
+over a long experiment, so always running one policy second would confound policy with
+order.
+
+## What the harness records
+
+For each side of the A/B it records:
+
+1. emitted token ids (**hard gate: they must be identical**),
+2. `seconds_per_token` from the run JSON,
+3. the CLI's `experts, whole run: ... GB read` physical expert-I/O total,
+4. peak RSS,
+5. raw logs and JSON results,
+6. `--dump-cache-trace` output for replay through `tools/sim_cache.py`.
+
+The physical-I/O total is intentionally the primary policy metric. The final-step raw
+cache hit count is not suitable: batch prefetch can count an expert as a hit even when it
+was read from disk moments earlier. The CLI already accumulates the whole-run expert bytes
+across generation steps, and the harness parses that explicit total.
+
+Timing is secondary and must be replicated. The summary prints mean, standard deviation,
+and within-policy spread, then compares the apparent ARC speed gain against that spread.
+A negative result is valid: the harness fails on changed output or missing measurements,
+not merely because ARC is slower or reads more bytes.
 
 ## Safety behavior
 
