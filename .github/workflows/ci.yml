@@ -181,19 +181,26 @@ jobs:
           fi
 
   python-lint:
-    name: python tools lint
+    name: python tools lint + cache policy lab
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - run: pip install --quiet ruff
+      - run: pip install --quiet ruff numpy
       # Gates. Style drift in tools that generate the test fixtures is worth catching,
       # and an unparseable tool is a broken fixture pipeline.
       - run: ruff check tools/ --output-format=github
       - name: Syntax check every tool
         run: python -m compileall -q tools/
+      - name: Cache policy unit tests
+        run: python tools/test_sim_cache.py
+      - name: Replay recorded expert trace
+        run: |
+          python tools/sim_cache.py tests/fixtures/expert_trace.bin \
+            --caps-gb 8,16,32,64,128,192 | tee "$RUNNER_TEMP/cache-policy.txt"
+          grep -Eq '^64[[:space:]]+GB.*36\.24%' "$RUNNER_TEMP/cache-policy.txt"
 
   shellcheck:
     name: shellcheck
